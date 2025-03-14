@@ -8,6 +8,9 @@
 
 namespace Fobia\Database\SphinxConnection\Eloquent\Query;
 
+use Closure;
+use DB;
+use Exception;
 use Foolz\SphinxQL\Facet;
 use Foolz\SphinxQL\MatchBuilder;
 use Illuminate\Database\Query\Builder as BaseBuilder;
@@ -48,129 +51,6 @@ class Grammar extends BaseGrammar
         return parent::compileSelect($query);
     }
 
-    protected function compileGrouporders(BaseBuilder $query, $groups)
-    {
-        $sql = [];
-        foreach ($groups as $k => $v) {
-            $sql[] = $k . ' ' . $v;
-        }
-        return 'WITHIN GROUP ORDER BY ' . implode(', ', $sql);
-    }
-
-    protected function compileOptions(BaseBuilder $query, $options = null)
-    {
-        $sql = [];
-        if (is_array($options)) {
-            foreach ($options as $row) {
-                $opt = $row[0];
-                $opt_val = $row[1];
-
-                // weights - Для опций, задающихся масивом
-                if ($opt == 'field_weights' || $opt == 'index_weights') {
-                    $weights = [];
-                    if (is_array($opt_val)) {
-                        foreach ($opt_val as $k => $v) {
-                            $weights[] = "{$k} = " . (int) $v;
-                        }
-                    } else {
-                        $weights[] = preg_replace("/\(|\)/", '', $opt_val);
-                    }
-                    $opt_val = '(' . implode(', ', $weights) . ')';
-                }
-
-                if ($opt == 'comment') {
-                    $opt_val = $this->wrapValue2($opt_val);
-                }
-
-                $sql[$opt] = $opt . ' = ' . $opt_val;
-            }
-        }
-
-        return 'OPTION ' . implode(', ', $sql);
-    }
-
-    /**
-     * FACET {expr_list} [BY {expr_list}] [ORDER BY {expr | FACET()} {ASC | DESC}] [LIMIT [offset,] count]
-     *
-     * @param BaseBuilder $query
-     * @param $facets
-     * @return \Illuminate\Database\Query\Builder|string
-     * @throws \Exception
-     */
-    protected function compileFacets(BaseBuilder $query, $facets)
-    {
-        $sql = [];
-        $query = '';
-        if (!empty($facets)) {
-            foreach ($facets as $facet) {
-                if (!$facet instanceof Facet) {
-                    throw new \Exception('Not Facet');
-                }
-                // dynamically set the own SphinxQL connection if the Facet doesn't own one
-                //if ($facet->getConnection() === null) {
-                //    $facet->setConnection($query->getConnection());
-                //    $sql[] = $facet->getFacet();
-                //    // go back to the status quo for reuse
-                //    $facet->setConnection();
-                //} else {
-                $sql[] = $facet->getFacet();
-                //}
-                //$facet = "FACET " .
-            }
-
-            $query .= "\n" . implode("\n", $sql);
-        }
-
-        return $query;
-    }
-
-    /**
-     * Compile the "limit" portions of the query.
-     *
-     * @param \Illuminate\Database\Query\Builder $query
-     * @param int $limit
-     * @return string
-     */
-    protected function compileLimit(BaseBuilder $query, $limit)
-    {
-        $limit = 1000;
-        $offset = 0;
-        if (!is_null($query->limit)) {
-            $limit = $query->limit;
-        }
-        if (!is_null($query->offset)) {
-            $offset = $query->offset;
-        }
-
-        return 'LIMIT ' . ((int) $offset) . ', ' . ((int) $limit);
-    }
-
-    /**
-     * @internal
-     * @param \Illuminate\Database\Query\Builder $query
-     * @param int $offset
-     * @return string
-     */
-    protected function compileOffset(BaseBuilder $query, $offset)
-    {
-        return '';
-    }
-
-    /**
-     * Compile the "from" portion of the query.
-     *
-     * @param  \Illuminate\Database\Query\Builder $query
-     * @param  string $table
-     * @return string
-     */
-    protected function compileFrom(BaseBuilder $query, $table)
-    {
-        if (is_array($table)) {
-            return 'FROM ' . implode(', ', $table);
-        }
-        return 'FROM ' . $this->wrapTable($table);
-    }
-
     /**
      * Compiles the MATCH part of the queries
      * Used by: SELECT, DELETE, UPDATE
@@ -189,7 +69,7 @@ class Grammar extends BaseGrammar
 
             foreach ($matchs as $match) {
                 $pre = '';
-                if ($match['column'] instanceof \Closure) {
+                if ($match['column'] instanceof Closure) {
                     $sub = new MatchBuilder($sphinxQL);
                     call_user_func($match['column'], $sub);
                     $pre .= $sub->compile()->getCompiled();
@@ -207,10 +87,16 @@ class Grammar extends BaseGrammar
                 }
 
                 if ($match['half']) {
-                    $pre .= $sphinxQL->halfEscapeMatch($match['value']);
+                    $escaped = $sphinxQL->halfEscapeMatch($match['value']);
                 } else {
-                    $pre .= $sphinxQL->escapeMatch($match['value']);
+                    $escaped = $sphinxQL->escapeMatch($match['value']);
                 }
+                if ($queryBuilder->wrapBrackets) {
+                    $escaped = str($escaped)->explode(' | ')->map(fn($k) => "($k)")->implode(' | ');
+                }
+
+                $pre .= $escaped;
+
                 if ($pre) {
                     $matched[] = '(' . $pre . ')';
                 }
@@ -236,8 +122,8 @@ class Grammar extends BaseGrammar
     /**
      * Prepare the bindings for an update statement.
      *
-     * @param  array  $bindings
-     * @param  array  $values
+     * @param array $bindings
+     * @param array $values
      * @return array
      */
     public function prepareBindingsForUpdate(array $bindings, array $values)
@@ -291,6 +177,17 @@ class Grammar extends BaseGrammar
         return $value;
     }
 
+    public function parameter($value)
+    {
+        return $this->isExpression($value)
+            ? $this->getValue($value)
+            : (
+            (($v = $this->quoteBinding($value)) !== null)
+                ? $v
+                : $this->wrapValue2($value)
+            );
+    }
+
     /**
      * Форматирует в синтаксис sphinx либо null
      *
@@ -306,7 +203,7 @@ class Grammar extends BaseGrammar
         } elseif ($value === false) {
             $value = 0;
         } elseif (is_int($value)) {
-            $value = (int) $value;
+            $value = (int)$value;
         } elseif (is_float($value)) {
             // Convert to non-locale aware float to prevent possible commas
             $value = sprintf('%F', $value);
@@ -320,6 +217,47 @@ class Grammar extends BaseGrammar
         return $value;
     }
 
+    protected function compileGrouporders(BaseBuilder $query, $groups)
+    {
+        $sql = [];
+        foreach ($groups as $k => $v) {
+            $sql[] = $k . ' ' . $v;
+        }
+        return 'WITHIN GROUP ORDER BY ' . implode(', ', $sql);
+    }
+
+    protected function compileOptions(BaseBuilder $query, $options = null)
+    {
+        $sql = [];
+        if (is_array($options)) {
+            foreach ($options as $row) {
+                $opt = $row[0];
+                $opt_val = $row[1];
+
+                // weights - Для опций, задающихся масивом
+                if ($opt == 'field_weights' || $opt == 'index_weights') {
+                    $weights = [];
+                    if (is_array($opt_val)) {
+                        foreach ($opt_val as $k => $v) {
+                            $weights[] = "{$k} = " . (int)$v;
+                        }
+                    } else {
+                        $weights[] = preg_replace("/\(|\)/", '', $opt_val);
+                    }
+                    $opt_val = '(' . implode(', ', $weights) . ')';
+                }
+
+                if ($opt == 'comment') {
+                    $opt_val = $this->wrapValue2($opt_val);
+                }
+
+                $sql[$opt] = $opt . ' = ' . $opt_val;
+            }
+        }
+
+        return 'OPTION ' . implode(', ', $sql);
+    }
+
     protected function wrapValue2($value)
     {
         if ($value === '*') {
@@ -327,8 +265,8 @@ class Grammar extends BaseGrammar
         }
 
         try {
-            return \DB::connection('sphinx')->getPdo()->quote($value);
-        } catch (\Exception $e) {
+            return DB::connection('sphinx')->getPdo()->quote($value);
+        } catch (Exception $e) {
             $value = str_replace('\\', '\\\\', $value);
             return '\'' . str_replace('\'', '\\\'', $value) . '\'';
         }
@@ -337,14 +275,85 @@ class Grammar extends BaseGrammar
         //return Sphinx::getConnection()->getPdo()->quote($value);
     }
 
-    public function parameter($value)
+    /**
+     * FACET {expr_list} [BY {expr_list}] [ORDER BY {expr | FACET()} {ASC | DESC}] [LIMIT [offset,] count]
+     *
+     * @param BaseBuilder $query
+     * @param $facets
+     * @return BaseBuilder|string
+     * @throws Exception
+     */
+    protected function compileFacets(BaseBuilder $query, $facets)
     {
-        return $this->isExpression($value)
-            ? $this->getValue($value)
-            : (
-                (($v = $this->quoteBinding($value)) !== null)
-                    ? $v
-                    : $this->wrapValue2($value)
-            );
+        $sql = [];
+        $query = '';
+        if (!empty($facets)) {
+            foreach ($facets as $facet) {
+                if (!$facet instanceof Facet) {
+                    throw new Exception('Not Facet');
+                }
+                // dynamically set the own SphinxQL connection if the Facet doesn't own one
+                //if ($facet->getConnection() === null) {
+                //    $facet->setConnection($query->getConnection());
+                //    $sql[] = $facet->getFacet();
+                //    // go back to the status quo for reuse
+                //    $facet->setConnection();
+                //} else {
+                $sql[] = $facet->getFacet();
+                //}
+                //$facet = "FACET " .
+            }
+
+            $query .= "\n" . implode("\n", $sql);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Compile the "limit" portions of the query.
+     *
+     * @param BaseBuilder $query
+     * @param int $limit
+     * @return string
+     */
+    protected function compileLimit(BaseBuilder $query, $limit)
+    {
+        $limit = 1000;
+        $offset = 0;
+        if (!is_null($query->limit)) {
+            $limit = $query->limit;
+        }
+        if (!is_null($query->offset)) {
+            $offset = $query->offset;
+        }
+
+        return 'LIMIT ' . ((int)$offset) . ', ' . ((int)$limit);
+    }
+
+    /**
+     * @param BaseBuilder $query
+     * @param int $offset
+     * @return string
+     * @internal
+     */
+    protected function compileOffset(BaseBuilder $query, $offset)
+    {
+        return '';
+    }
+
+    /**
+     * Compile the "from" portion of the query.
+     *
+     * @param BaseBuilder $query
+     * @param string $table
+     * @return string
+     */
+    protected function compileFrom(BaseBuilder $query, $table)
+    {
+        if (is_array($table)) {
+            return 'FROM ' . implode(', ', $table);
+        }
+        return 'FROM ' . $this->wrapTable($table);
     }
 }

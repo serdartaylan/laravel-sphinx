@@ -8,9 +8,13 @@
 
 namespace Fobia\Database\SphinxConnection\Eloquent\Query;
 
+use Closure;
+use Exception;
+use Fobia\Database\SphinxConnection\SphinxConnection;
 use Foolz\SphinxQL\Facet;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Arr;
+use RuntimeException;
 
 /**
  * Class Builder
@@ -42,50 +46,12 @@ class Builder extends QueryBuilder
 
     public $match;
 
-    /**
-     * Get the SQL representation of the query.
-     *
-     * @return string
-     */
-    public function toSql()
-    {
-        return $this->grammar->compileSelect($this);
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    protected function runSelect()
-    {
-        $bindings = $this->getBindings();
-        $sql = $this->toSql();
-        foreach ($bindings as $k => $v) {
-            $v = $this->grammar->quoteBinding($v);
-            if ($v !== null) {
-                $sql = preg_replace('/ \?/', ' ' . $v, $sql, 1);
-                unset($bindings[$k]);
-            } else {
-                $sql = preg_replace('/ \?/', ' ?: ', $sql, 1);
-            }
-        }
-        $sql = preg_replace('/ \?:/', ' ?', $sql);
-        return $this->connection->select($sql, $bindings, !$this->useWritePdo);
-    }
-
-    /**
-     * @param $value
-     * @return mixed
-     * @deprecated
-     */
-    protected function quoteBinding($value)
-    {
-        return $this->grammar->quoteBinding($value);
-    }
+    public $wrapBrackets = false;
 
     /**
      * Replace a new record into the database.
      *
-     * @param  array $values
+     * @param array $values
      * @return bool
      *
      * @see \Illuminate\Database\Query\Grammars\Grammar::compileInsert
@@ -166,7 +132,7 @@ class Builder extends QueryBuilder
         if (is_string($operator) && in_array(strtolower($operator), ['in', 'not in', '=', '<', '>', '<=', '>=', '<>', '!='])) {
             //$values = array_slice(func_get_args(), 3);
         } else {
-            throw new \RuntimeException('Not defened operator');
+            throw new RuntimeException('Not defened operator');
         }
 
         $operator = strtolower($operator);
@@ -174,21 +140,44 @@ class Builder extends QueryBuilder
             $ids = array_slice(func_get_args(), 2);
             $ids = $this->filterParamsUint($ids);
         } else {
-            $ids = array_merge((array) $values, array_slice(func_get_args(), 3));
+            $ids = array_merge((array)$values, array_slice(func_get_args(), 3));
         }
 
         if ($ids) {
             foreach ($ids as $id) {
                 if ($operator == 'in') {
-                    $this->whereIn($column, (array) $id);
+                    $this->whereIn($column, (array)$id);
                 } elseif ($operator == 'not in') {
-                    $this->whereNotIn($column, (array) $id);
+                    $this->whereNotIn($column, (array)$id);
                 } else {
                     $this->where($column, $operator, $id);
                 }
             }
         }
         return $this;
+    }
+
+    /**
+     * Масив преобразуется в список целых числе, null и пустые строки игнорятся
+     *
+     * Example:
+     *     filterParamsUint([1,2,null,4])  => [1,2,3]
+     *     filterParamsUint([1,[2,[null,4]]])  => [1,2,3]
+     *
+     * @param $args
+     * @return array|bool
+     */
+    protected function filterParamsUint($args)
+    {
+        $args = Arr::flatten((array)$args);
+        $args = array_filter((array)$args, function ($v) {
+            return ($v !== null) && ($v !== '');
+        });
+        if (!count($args)) {
+            return false;
+        }
+        $ids = array_map('intval', $args);
+        return array_unique(array_values($ids));
     }
 
     /**
@@ -218,7 +207,7 @@ class Builder extends QueryBuilder
      * 'field_weights'= (title=10, body=3), -    a named integer list (per-field user weights for ranking)
      * 'index_weights' = (products_rt=10, body=3),    - a named integer list (per-index user weights for ranking)
      *
-     * @param string $name  Option name
+     * @param string $name Option name
      * @param string $value Option value
      *
      * @return self
@@ -238,7 +227,7 @@ class Builder extends QueryBuilder
      * Adds to the previously added columns
      * Works just like a classic ORDER BY
      *
-     * @param string $column    The column to group by
+     * @param string $column The column to group by
      * @param string $direction The group by direction (asc/desc)
      *
      * @return self
@@ -247,7 +236,7 @@ class Builder extends QueryBuilder
     {
         $direction = mb_strtoupper($direction);
         if ($direction != 'ASC' && $direction != 'DESC') {
-            throw new \RuntimeException('Undefined direction group (asc/desc) - ' . $direction);
+            throw new RuntimeException('Undefined direction group (asc/desc) - ' . $direction);
         }
         $this->grouporders[$column] = $direction;
         return $this;
@@ -277,15 +266,15 @@ class Builder extends QueryBuilder
      * Allows passing an array with the key as column and value as value
      * Used in: INSERT, REPLACE, UPDATE
      *
-     * @param \Closure|\Foolz\SphinxQL\Facet $callback
+     * @param Closure|Facet $callback
      * @return self
-     * @throws \Exception
+     * @throws Exception
      */
     public function facet($callback)
     {
         if (!$callback instanceof Facet) {
-            if (!$callback instanceof \Closure) {
-                throw new \Exception('Not Facet');
+            if (!$callback instanceof Closure) {
+                throw new Exception('Not Facet');
             }
             $facet = new Facet($this->getConnection()->getSphinxQLDriversConnection());
             $callback($facet);
@@ -299,26 +288,38 @@ class Builder extends QueryBuilder
     }
 
     /**
-     * Масив преобразуется в список целых числе, null и пустые строки игнорятся
-     *
-     * Example:
-     *     filterParamsUint([1,2,null,4])  => [1,2,3]
-     *     filterParamsUint([1,[2,[null,4]]])  => [1,2,3]
-     *
-     * @param $args
-     * @return array|bool
+     * @return SphinxConnection
      */
-    protected function filterParamsUint($args)
+    public function getConnection()
     {
-        $args = Arr::flatten((array) $args);
-        $args = array_filter((array) $args, function ($v) {
-            return ($v !== null) && ($v !== '');
-        });
-        if (!count($args)) {
-            return false;
+        return parent::getConnection();
+    }
+
+    public function setWrapBrackets($value)
+    {
+        $this->wrapBrackets = $value;
+
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function runSelect()
+    {
+        $bindings = $this->getBindings();
+        $sql = $this->toSql();
+        foreach ($bindings as $k => $v) {
+            $v = $this->grammar->quoteBinding($v);
+            if ($v !== null) {
+                $sql = preg_replace('/ \?/', ' ' . $v, $sql, 1);
+                unset($bindings[$k]);
+            } else {
+                $sql = preg_replace('/ \?/', ' ?: ', $sql, 1);
+            }
         }
-        $ids = array_map('intval', $args);
-        return array_unique(array_values($ids));
+        $sql = preg_replace('/ \?:/', ' ?', $sql);
+        return $this->connection->select($sql, $bindings, !$this->useWritePdo);
     }
 
     /*
@@ -328,10 +329,22 @@ class Builder extends QueryBuilder
      */
 
     /**
-     * @return \Fobia\Database\SphinxConnection\SphinxConnection
+     * Get the SQL representation of the query.
+     *
+     * @return string
      */
-    public function getConnection()
+    public function toSql()
     {
-        return parent::getConnection();
+        return $this->grammar->compileSelect($this);
+    }
+
+    /**
+     * @param $value
+     * @return mixed
+     * @deprecated
+     */
+    protected function quoteBinding($value)
+    {
+        return $this->grammar->quoteBinding($value);
     }
 }
