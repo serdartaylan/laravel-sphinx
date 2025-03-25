@@ -26,7 +26,7 @@ class Builder extends EloquentBuilder
         return $this->paginate($this->getModel()->maxMatches(),$columns,'page',1);
     }
 
-    public function paginate($perPage = 20, $columns = ['*'], $pageName = 'page', $page = null)
+    public function paginate($perPage = 20, $columns = ['*'], $pageName = 'page', $page = null, $total = null)
     {
         $page = $page ?: Paginator::resolveCurrentPage($pageName);
 
