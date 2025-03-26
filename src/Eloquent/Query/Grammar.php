@@ -44,7 +44,13 @@ class Grammar extends BaseGrammar
      */
     public function compileSelect(BaseBuilder $query)
     {
+
         if (is_array($query->columns)) {
+
+            $query->columns = array_map(function ($column) use ($query) {
+                return is_string($column) ? $column : $column->getValue($query->connection->getQueryGrammar());
+            }, $query->columns);
+
             $query->columns = array_unique($query->columns);
         }
 
